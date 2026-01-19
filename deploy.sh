@@ -18,7 +18,7 @@ readonly EX_ROOT=12
 readonly EX_TOOL=20
 readonly EX_PREREQ=21
 
-# Config errors (scripts, profiles, lockfile expectations)
+# Config errors (profiles, lockfile expectations, env templates)
 readonly EX_CONFIG=30
 
 # Step failures
@@ -56,19 +56,25 @@ Usage:
   $SCRIPT_NAME [--project /path/to/project] --ios|--android --dev|--prod [options]
 
 Required:
-  --ios | --android          Target platform
-  --dev | --prod             Target environment
+  --ios | --android                 Target platform
+  --dev | --development             Development environment (uses .env.dev -> .env)
+  --prod | --production             Production environment (uses .env.prod -> .env)
 
 Options:
-  --project <dir>            Run from a specific project directory (default: current directory)
-  --profile <name>           Override EAS build profile (default: development for --dev, production for --prod)
-  --clean                    Remove node_modules BEFORE install when using npm install (skipped for npm ci)
-  --force-clean              Allow removing node_modules even if it is a symlink (safety override)
-  --npm-ci                   Force npm ci (requires package-lock.json)
-  --npm-install              Force npm install
-  --skip-prereq              Skip iOS/Android local build prerequisite checks (not recommended)
-  --skip-root-check          Skip project-root sanity checks (not recommended)
-  -h, --help                 Show this help
+  --project <dir>                   Run from a specific project directory (default: current directory)
+  --profile <name>                  Override EAS build profile (default: development for dev, production for prod)
+
+  --env-dev-file <path>             Dev env template file (default: .env.dev)
+  --env-prod-file <path>            Prod env template file (default: .env.prod)
+  --env-out-file <path>             Output env file written before prebuild (default: .env)
+
+  --clean                           Remove node_modules BEFORE install when using npm install (skipped for npm ci)
+  --force-clean                     Allow removing node_modules even if it is a symlink (safety override)
+  --npm-ci                          Force npm ci (requires package-lock.json)
+  --npm-install                     Force npm install
+  --skip-prereq                     Skip iOS/Android local build prerequisite checks (not recommended)
+  --skip-root-check                 Skip project-root sanity checks (not recommended)
+  -h, --help                        Show this help
 
 Defaults:
   - If CI=true/1/yes -> npm ci
@@ -76,6 +82,7 @@ Defaults:
 
 Examples:
   $SCRIPT_NAME --ios --dev
+  $SCRIPT_NAME --ios --development
   $SCRIPT_NAME --project /Users/me/myapp --android --prod
   $SCRIPT_NAME --android --prod --profile staging
   CI=true $SCRIPT_NAME --ios --prod --npm-ci
@@ -119,6 +126,8 @@ is_ci() {
 validate_json_file() {
   local file="$1"
   [[ -f "$file" ]] || die "$EX_ROOT" "Required file not found: $file (cwd: $(pwd))"
+
+  # eas.json can include comments in some projects; strip // and /* */ before parsing.
   if [[ "$file" == "eas.json" ]]; then
     FILE="$file" node -e 'const fs=require("fs"); const s=fs.readFileSync(process.env.FILE,"utf8").replace(/\/\/.*$/gm,"").replace(/\/\*[\s\S]*?\*\//g,""); JSON.parse(s);' >/dev/null 2>&1 \
       || die "$EX_ROOT" "$file is not valid JSON (cannot parse)."
@@ -128,21 +137,15 @@ validate_json_file() {
   fi
 }
 
-npm_script_exists() {
-  local script="$1"
-  NODE_SCRIPT_NAME="$script" node -e '
+package_has_dep() {
+  local dep="$1"
+  NODE_DEP="$dep" node -e '
     const fs=require("fs");
     const pkg=JSON.parse(fs.readFileSync("package.json","utf8"));
-    const s=process.env.NODE_SCRIPT_NAME;
-    process.exit(pkg.scripts && Object.prototype.hasOwnProperty.call(pkg.scripts, s) ? 0 : 1);
+    const d=process.env.NODE_DEP;
+    const has = (pkg.dependencies && pkg.dependencies[d]) || (pkg.devDependencies && pkg.devDependencies[d]);
+    process.exit(has ? 0 : 1);
   ' >/dev/null 2>&1
-}
-
-require_npm_script() {
-  local script="$1"
-  if ! npm_script_exists "$script"; then
-    die "$EX_CONFIG" "npm script not found in package.json: \"$script\""
-  fi
 }
 
 eas_profile_exists() {
@@ -166,7 +169,7 @@ eas_profiles_list() {
 
 clean_node_modules() {
   if [[ ! -e node_modules ]]; then
-    log "INFO" "node_modules not present; skipping removal."
+    log "node_modules not present; skipping removal."
     return 0
   fi
 
@@ -175,9 +178,52 @@ clean_node_modules() {
     die "$EX_ROOT" "Refusing to remove node_modules because it is a symlink. Use --force-clean to override."
   fi
 
-  log "INFO" "Removing node_modules (requested via --clean)..."
+  log "Removing node_modules (requested via --clean)..."
   rm -rf -- node_modules || die "$EX_ROOT" "Failed to remove node_modules."
-  log "INFO" "node_modules removed."
+  log "node_modules removed."
+}
+
+warn_if_git_tracked() {
+  local file="$1"
+  command -v git >/dev/null 2>&1 || return 0
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  if git ls-files --error-unmatch "$file" >/dev/null 2>&1; then
+    warn "$file is tracked by git. This script overwrites it; consider adding it to .gitignore."
+  fi
+}
+
+apply_env_file_atomic() {
+  local src="$1"
+  local dest="$2"
+
+  [[ -f "$src" ]] || die "$EX_CONFIG" "Env template file not found: $src"
+  [[ -r "$src" ]] || die "$EX_CONFIG" "Env template file is not readable: $src"
+
+  # Safety: avoid clobbering via symlink.
+  if [[ -L "$dest" ]]; then
+    die "$EX_ROOT" "Refusing to write $dest because it is a symlink (safety)."
+  fi
+  if [[ -d "$dest" ]]; then
+    die "$EX_ROOT" "Refusing to write $dest because it is a directory."
+  fi
+
+  warn_if_git_tracked "$dest"
+
+  local tmp
+  tmp="$(mktemp "${dest}.tmp.XXXXXX")" || die "$EX_SETENV" "mktemp failed while preparing to write $dest"
+  chmod 600 "$tmp" >/dev/null 2>&1 || true
+
+  if ! cat "$src" > "$tmp"; then
+    rm -f -- "$tmp" || true
+    die "$EX_SETENV" "Failed to write temp env file from $src"
+  fi
+
+  if ! mv -f -- "$tmp" "$dest"; then
+    rm -f -- "$tmp" || true
+    die "$EX_SETENV" "Failed to move env file into place: $dest"
+  fi
+
+  chmod 600 "$dest" >/dev/null 2>&1 || true
 }
 
 check_ios_prereqs_pre() {
@@ -190,6 +236,10 @@ check_ios_prereqs_pre() {
   require_cmd xcodebuild
   require_cmd xcode-select
 
+  # Expo EAS local builds require CocoaPods and fastlane in the environment. (Doc: local builds prerequisites)
+  require_cmd pod
+  require_cmd fastlane
+
   xcodebuild -version >/dev/null 2>&1 \
     || die "$EX_PREREQ" "xcodebuild exists but is not usable. Ensure Xcode is installed and license accepted (sudo xcodebuild -license)."
 
@@ -199,10 +249,9 @@ check_ios_prereqs_pre() {
 
 check_ios_prereqs_post() {
   [[ -d ios ]] || die "$EX_PREBUILD" "iOS project directory (./ios) not found after prebuild."
+  # If a Podfile is generated, pod must be present (we already check pre, but keep a sanity check).
   if [[ -f ios/Podfile ]]; then
     require_cmd pod
-  else
-    warn "ios/Podfile not found after prebuild. If eas build fails, verify your prebuild scripts generate the iOS project."
   fi
 }
 
@@ -245,11 +294,9 @@ check_android_prereqs_post() {
 }
 
 validate_project_root() {
-  # Strong checks to reduce “wrong folder” accidents.
   [[ -f package.json ]] || die "$EX_ROOT" "package.json not found in $(pwd). Run from project root or use --project."
   [[ -f eas.json ]] || die "$EX_ROOT" "eas.json not found in $(pwd). This script expects EAS profiles in eas.json."
 
-  # Heuristic: warn if no app config; still proceed.
   if [[ ! -f app.json && ! -f app.config.js && ! -f app.config.ts && ! -f app.config.json ]]; then
     warn "No app.json/app.config.* found. If this is not the correct project root, rerun with --project."
   fi
@@ -262,11 +309,17 @@ PROJECT_DIR=""
 PLATFORM=""
 ENVIRONMENT=""
 PROFILE_OVERRIDE=""
+
 CLEAN_NODE_MODULES=0
 FORCE_CLEAN=0
 INSTALL_MODE=""        # "npm-ci" or "npm-install"
 SKIP_PREREQ=0
 SKIP_ROOT_CHECK=0
+
+# Env file defaults (new behavior)
+ENV_DEV_FILE=".env.dev"
+ENV_PROD_FILE=".env.prod"
+ENV_OUT_FILE=".env"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -285,11 +338,11 @@ while [[ $# -gt 0 ]]; do
       [[ -z "$PLATFORM" ]] || arg_error "Conflicting platform flags (already set to \"$PLATFORM\")."
       PLATFORM="android"
       ;;
-    --dev)
+    --dev|--development)
       [[ -z "$ENVIRONMENT" ]] || arg_error "Conflicting environment flags (already set to \"$ENVIRONMENT\")."
       ENVIRONMENT="development"
       ;;
-    --prod)
+    --prod|--production)
       [[ -z "$ENVIRONMENT" ]] || arg_error "Conflicting environment flags (already set to \"$ENVIRONMENT\")."
       ENVIRONMENT="production"
       ;;
@@ -298,6 +351,24 @@ while [[ $# -gt 0 ]]; do
       [[ $# -gt 0 ]] || arg_error "Missing value for --profile."
       [[ "$1" != --* ]] || arg_error "Missing value for --profile (got another flag: $1)."
       PROFILE_OVERRIDE="$1"
+      ;;
+    --env-dev-file)
+      shift
+      [[ $# -gt 0 ]] || arg_error "Missing value for --env-dev-file."
+      [[ "$1" != --* ]] || arg_error "Missing value for --env-dev-file (got another flag: $1)."
+      ENV_DEV_FILE="$1"
+      ;;
+    --env-prod-file)
+      shift
+      [[ $# -gt 0 ]] || arg_error "Missing value for --env-prod-file."
+      [[ "$1" != --* ]] || arg_error "Missing value for --env-prod-file (got another flag: $1)."
+      ENV_PROD_FILE="$1"
+      ;;
+    --env-out-file)
+      shift
+      [[ $# -gt 0 ]] || arg_error "Missing value for --env-out-file."
+      [[ "$1" != --* ]] || arg_error "Missing value for --env-out-file (got another flag: $1)."
+      ENV_OUT_FILE="$1"
       ;;
     --clean) CLEAN_NODE_MODULES=1 ;;
     --force-clean) FORCE_CLEAN=1 ;;
@@ -323,7 +394,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$PLATFORM" ]] || arg_error "Platform must be specified (--ios or --android)."
-[[ -n "$ENVIRONMENT" ]] || arg_error "Environment must be specified (--dev or --prod)."
+[[ -n "$ENVIRONMENT" ]] || arg_error "Environment must be specified (--dev/--development or --prod/--production)."
 
 if [[ -n "$PROJECT_DIR" ]]; then
   [[ -d "$PROJECT_DIR" ]] || die "$EX_PROJECT" "Project directory not found: $PROJECT_DIR"
@@ -344,23 +415,26 @@ fi
 validate_json_file "package.json"
 validate_json_file "eas.json"
 
-# -------------------------
-# Derive scripts/profile
-# -------------------------
-if [[ "$ENVIRONMENT" == "development" ]]; then
-  SET_ENV_SCRIPT="set-env:dev"
-  DEFAULT_PROFILE="development"
-else
-  SET_ENV_SCRIPT="set-env:prod"
-  DEFAULT_PROFILE="production"
+# This flow is designed for Expo projects (we call expo prebuild).
+if ! package_has_dep "expo"; then
+  die "$EX_CONFIG" "package.json does not include dependency \"expo\". This script expects an Expo project to run expo prebuild."
 fi
 
-PREBUILD_SCRIPT="prebuild:${ENVIRONMENT}:${PLATFORM}"
+# -------------------------
+# Derive env/profile
+# -------------------------
+if [[ "$ENVIRONMENT" == "development" ]]; then
+  DEFAULT_PROFILE="development"
+  ENV_SRC_FILE="$ENV_DEV_FILE"
+else
+  DEFAULT_PROFILE="production"
+  ENV_SRC_FILE="$ENV_PROD_FILE"
+fi
+
 EAS_PROFILE="${PROFILE_OVERRIDE:-$DEFAULT_PROFILE}"
 
-# Validate npm scripts exist early (also helps avoid running in wrong directory)
-require_npm_script "$SET_ENV_SCRIPT"
-require_npm_script "$PREBUILD_SCRIPT"
+# Validate env template file exists early (fail-fast)
+[[ -f "$ENV_SRC_FILE" ]] || die "$EX_CONFIG" "Env template file not found: $ENV_SRC_FILE (configure via --env-dev-file/--env-prod-file)."
 
 # Validate EAS profile exists
 if ! eas_profile_exists "$EAS_PROFILE"; then
@@ -376,12 +450,14 @@ if [[ -z "$INSTALL_MODE" ]]; then
   fi
 fi
 
-log "INFO" "Deploy started.
+log "Deploy started.
 cwd=$(pwd)
 platform=$PLATFORM
 env=$ENVIRONMENT
 eas_profile=$EAS_PROFILE
 install_mode=$INSTALL_MODE
+env_template=$ENV_SRC_FILE
+env_out=$ENV_OUT_FILE
 clean_node_modules=$CLEAN_NODE_MODULES
 skip_prereq=$SKIP_PREREQ"
 
@@ -403,13 +479,13 @@ fi
 # -------------------------
 if [[ "$INSTALL_MODE" == "npm-ci" ]]; then
   if [[ "$CLEAN_NODE_MODULES" -eq 1 ]]; then
-    log "INFO" "--clean specified, but install_mode is npm-ci. Skipping explicit node_modules removal (npm ci does a clean install)."
+    log "--clean specified, but install_mode is npm-ci. Skipping explicit node_modules removal (npm ci does a clean install)."
   fi
 else
   if [[ "$CLEAN_NODE_MODULES" -eq 1 ]]; then
     clean_node_modules
   else
-    log "INFO" "node_modules cleanup not requested; skipping."
+    log "node_modules cleanup not requested; skipping."
   fi
 fi
 
@@ -418,33 +494,41 @@ fi
 # -------------------------
 if [[ "$INSTALL_MODE" == "npm-ci" ]]; then
   [[ -f package-lock.json ]] || die "$EX_CONFIG" "npm ci requested but package-lock.json not found. Commit a lockfile or use --npm-install."
-  log "INFO" "Running npm ci..."
+  log "Running npm ci..."
   if ! npm ci --no-audit --no-fund; then
     die "$EX_INSTALL" "npm ci failed."
   fi
-  log "INFO" "npm ci OK."
+  log "npm ci OK."
 else
-  log "INFO" "Running npm install..."
+  log "Running npm install..."
   if ! npm install --no-audit --no-fund; then
     die "$EX_INSTALL" "npm install failed."
   fi
-  log "INFO" "npm install OK."
+  log "npm install OK."
 fi
 
 # -------------------------
-# Set env & prebuild
+# Set env & prebuild (NO package.json scripts)
 # -------------------------
-log "INFO" "Running npm run $SET_ENV_SCRIPT..."
-if ! npm run "$SET_ENV_SCRIPT"; then
-  die "$EX_SETENV" "npm run $SET_ENV_SCRIPT failed."
-fi
-log "INFO" "Env set."
+log "Applying env: $ENV_SRC_FILE -> $ENV_OUT_FILE ..."
+apply_env_file_atomic "$ENV_SRC_FILE" "$ENV_OUT_FILE"
+log "Env applied."
 
-log "INFO" "Running npm run $PREBUILD_SCRIPT..."
-if ! npm run "$PREBUILD_SCRIPT"; then
-  die "$EX_PREBUILD" "npm run $PREBUILD_SCRIPT failed."
+# Use local Expo CLI (deterministic; no global expo required)
+EXPO_BIN="./node_modules/.bin/expo"
+if [[ ! -f "$EXPO_BIN" ]]; then
+  die "$EX_CONFIG" "Expo CLI binary not found at $EXPO_BIN. Ensure the \"expo\" dependency is installed and npm install succeeded."
 fi
-log "INFO" "Prebuild done."
+if [[ ! -x "$EXPO_BIN" ]]; then
+  chmod +x "$EXPO_BIN" >/dev/null 2>&1 || true
+fi
+
+log "Running expo prebuild for platform=$PLATFORM..."
+# Put --non-interactive BEFORE subcommand for safest parsing of global options.
+if ! "$EXPO_BIN" --non-interactive prebuild --platform "$PLATFORM"; then
+  die "$EX_PREBUILD" "expo prebuild failed."
+fi
+log "Prebuild done."
 
 # Post-prebuild checks
 if [[ "$SKIP_PREREQ" -ne 1 ]]; then
@@ -458,10 +542,10 @@ fi
 # -------------------------
 # EAS build
 # -------------------------
-log "INFO" "Running eas build --platform $PLATFORM --profile $EAS_PROFILE --local --non-interactive..."
+log "Running eas build --platform $PLATFORM --profile $EAS_PROFILE --local --non-interactive..."
 if ! eas build --platform "$PLATFORM" --profile "$EAS_PROFILE" --local --non-interactive; then
   die "$EX_EAS" "eas build failed."
 fi
 
-log "INFO" "Deploy finished successfully."
+log "Deploy finished successfully."
 exit "$EX_SUCCESS"
