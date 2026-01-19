@@ -1,16 +1,28 @@
-# EAS Local Deploy Script
+# EAS Local Deploy Script (with Expo Prebuild + Env Switching)
 
-A small, safer wrapper around `npm` + `eas build --local` to standardize builds and reduce common footguns:
+This repository provides a Bash script to standardize local EAS builds:
 
-- Prevents conflicting flags
-- Validates `--project` values
-- Optional/safe `node_modules` cleanup
-- Uses `npm ci` in CI by default (deterministic installs)
-- Validates required npm scripts exist before running
-- Preflight checks for iOS/Android local build dependencies
-- Validates EAS build profile exists in `eas.json`
-- Multi-line safe logging
-- Structured exit codes
+- Selects environment (dev/prod) by overwriting `.env`
+- Runs `expo prebuild` for the selected platform
+- Runs `eas build --local --non-interactive`
+- Provides safer defaults (conflicting flags detection, optional node_modules cleanup, deterministic installs in CI, etc.)
+
+## What this script does
+
+When you run:
+
+- `./deploy.sh --ios --dev` (or `--development`)
+
+  - Writes `.env.dev` into `.env`
+  - Runs `expo prebuild --platform ios`
+  - Runs `eas build --platform ios --profile development --local --non-interactive`
+
+- `./deploy.sh --ios --prod` (or `--production`)
+  - Writes `.env.prod` into `.env`
+  - Runs `expo prebuild --platform ios`
+  - Runs `eas build --platform ios --profile production --local --non-interactive`
+
+Same logic applies for `--android`.
 
 ## Requirements
 
@@ -18,41 +30,60 @@ General:
 
 - Bash
 - Node.js + npm
-- `eas` CLI (`npm i -g @expo/eas-cli`)
+- EAS CLI (`eas`) available in PATH (install and login before running local builds)
 
 iOS local builds:
 
 - macOS
-- Xcode (`xcodebuild`)
-- Xcode Command Line Tools (`xcode-select`)
-- CocoaPods (`pod`) if your iOS project uses a Podfile
+- Xcode + Command Line Tools (`xcodebuild`, `xcode-select`)
+- CocoaPods (`pod`)
+- fastlane (`fastlane`)
 
 Android local builds:
 
 - Java (`java`)
 - Android SDK (`ANDROID_SDK_ROOT` or `ANDROID_HOME`)
-- `sdkmanager` available in PATH (via Android commandline-tools)
+- `sdkmanager` available (Android commandline-tools)
 
-## Expected npm scripts
+> Note: Local EAS builds require your machine to have the necessary native build toolchain installed.
 
-This script assumes your `package.json` contains:
+## Environment files
 
-- `set-env:dev`
-- `set-env:prod`
-- `prebuild:development:ios`
-- `prebuild:production:ios`
-- `prebuild:development:android`
-- `prebuild:production:android`
+By default, the script expects:
 
-If your project uses different names, you can either:
+- `.env.dev` (development template)
+- `.env.prod` (production template)
 
-- rename your scripts to match, or
-- fork/adjust the script mapping.
+It overwrites:
+
+- `.env` (default output file)
+
+You can override these paths:
+
+- `--env-dev-file <path>`
+- `--env-prod-file <path>`
+- `--env-out-file <path>`
 
 ## Usage
 
 ```bash
-./deploy --ios --dev
-./deploy --android --prod
-./deploy --project /path/to/project --ios --prod
+chmod +x ./deploy.sh
+
+# iOS dev
+./deploy.sh --ios --dev
+
+# iOS prod
+./deploy.sh --ios --prod
+
+# Android dev (alias)
+./deploy.sh --android --development
+
+# Android prod (alias)
+./deploy.sh --android --production
+
+# Run from a different directory
+./deploy.sh --project /path/to/project --ios --dev
+
+# Override EAS profile
+./deploy.sh --android --prod --profile staging
 ```
