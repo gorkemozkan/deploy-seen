@@ -1,6 +1,6 @@
 # Deploy Seen
 
-This repository provides a Bash script to standardize local EAS builds:
+Bash script to standardize local EAS builds.
 
 - Selects environment (dev/prod) by overwriting `.env`
 - Runs `expo prebuild` for the selected platform
