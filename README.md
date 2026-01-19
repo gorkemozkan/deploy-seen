@@ -1,4 +1,4 @@
-# EAS Local Deploy Script (with Expo Prebuild + Env Switching)
+# Deploy Seen
 
 This repository provides a Bash script to standardize local EAS builds:
 
