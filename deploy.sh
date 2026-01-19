@@ -119,8 +119,13 @@ is_ci() {
 validate_json_file() {
   local file="$1"
   [[ -f "$file" ]] || die "$EX_ROOT" "Required file not found: $file (cwd: $(pwd))"
-  FILE="$file" node -e 'const fs=require("fs"); JSON.parse(fs.readFileSync(process.env.FILE,"utf8"));' >/dev/null 2>&1 \
-    || die "$EX_ROOT" "$file is not valid JSON (cannot parse)."
+  if [[ "$file" == "eas.json" ]]; then
+    FILE="$file" node -e 'const fs=require("fs"); const s=fs.readFileSync(process.env.FILE,"utf8").replace(/\/\/.*$/gm,"").replace(/\/\*[\s\S]*?\*\//g,""); JSON.parse(s);' >/dev/null 2>&1 \
+      || die "$EX_ROOT" "$file is not valid JSON (cannot parse)."
+  else
+    FILE="$file" node -e 'const fs=require("fs"); JSON.parse(fs.readFileSync(process.env.FILE,"utf8"));' >/dev/null 2>&1 \
+      || die "$EX_ROOT" "$file is not valid JSON (cannot parse)."
+  fi
 }
 
 npm_script_exists() {
@@ -144,7 +149,7 @@ eas_profile_exists() {
   local profile="$1"
   NODE_EAS_PROFILE="$profile" node -e '
     const fs=require("fs");
-    const eas=JSON.parse(fs.readFileSync("eas.json","utf8"));
+    const eas=JSON.parse(fs.readFileSync("eas.json","utf8").replace(/\/\/.*$/gm,"").replace(/\/\*[\s\S]*?\*\//g,""));
     const p=process.env.NODE_EAS_PROFILE;
     process.exit(eas.build && Object.prototype.hasOwnProperty.call(eas.build, p) ? 0 : 1);
   ' >/dev/null 2>&1
@@ -153,7 +158,7 @@ eas_profile_exists() {
 eas_profiles_list() {
   node -e '
     const fs=require("fs");
-    const eas=JSON.parse(fs.readFileSync("eas.json","utf8"));
+    const eas=JSON.parse(fs.readFileSync("eas.json","utf8").replace(/\/\/.*$/gm,"").replace(/\/\*[\s\S]*?\*\//g,""));
     const keys=Object.keys((eas && eas.build) || {});
     console.log(keys.length ? keys.join(", ") : "(none)");
   '
