@@ -27,6 +27,7 @@ readonly EX_SETENV=41
 readonly EX_PREBUILD=42
 readonly EX_EAS=50
 readonly EX_SUBMIT=51
+readonly EX_BUMP=43
 
 # Unhandled
 readonly EX_UNEXPECTED=99
@@ -74,6 +75,7 @@ Options:
   --env-prod-file <path>            Prod env template file (default: .env.prod)
   --env-out-file <path>             Output env file written before prebuild (default: .env)
 
+  --bump                            Increment version (patch), buildNumber, and versionCode before build
   --clean                           Remove node_modules BEFORE install when using npm install (skipped for npm ci)
   --force-clean                     Allow removing node_modules even if it is a symlink (safety override)
   --npm-ci                          Force npm ci (requires package-lock.json)
@@ -98,6 +100,7 @@ Examples:
   $SCRIPT_NAME --both --prod
   $SCRIPT_NAME --both --prod --tf
   $SCRIPT_NAME --both --dev
+  $SCRIPT_NAME --ios --dev --bump
 EOF
 }
 
@@ -187,6 +190,116 @@ eas_submit_profile_exists() {
     const p=process.env.NODE_EAS_PROFILE;
     process.exit(eas.submit && Object.prototype.hasOwnProperty.call(eas.submit, p) ? 0 : 1);
   ' >/dev/null 2>&1
+}
+
+# -------------------------
+# Timing helpers
+# -------------------------
+_step_times=""
+_current_step_name=""
+_current_step_start=0
+_deploy_start=0
+
+step_start() {
+  _current_step_name="$1"
+  _current_step_start=$(date +%s)
+}
+
+step_end() {
+  local elapsed=$(( $(date +%s) - _current_step_start ))
+  _step_times="${_step_times}${_current_step_name}|${elapsed}\n"
+}
+
+format_duration() {
+  local secs="$1"
+  if [[ $secs -ge 60 ]]; then
+    printf '%dm %02ds' $((secs / 60)) $((secs % 60))
+  else
+    printf '%ds' "$secs"
+  fi
+}
+
+print_timing_summary() {
+  local total=$(( $(date +%s) - _deploy_start ))
+  log "────────────────────────────────────"
+  log "$(printf '%-30s %s' "Step" "Duration")"
+  log "────────────────────────────────────"
+  while IFS='|' read -r name secs; do
+    [[ -z "$name" ]] && continue
+    log "$(printf '%-30s %s' "$name" "$(format_duration "$secs")")"
+  done < <(printf '%b' "$_step_times")
+  log "────────────────────────────────────"
+  log "$(printf '%-30s %s' "Total" "$(format_duration "$total")")"
+}
+
+# -------------------------
+# Version bump helpers
+# -------------------------
+bump_package_json_version() {
+  node -e '
+    const fs = require("fs");
+    const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+    const parts = (pkg.version || "0.0.0").split(".");
+    parts[2] = String(Number(parts[2] || 0) + 1);
+    pkg.version = parts.join(".");
+    fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+    console.log(pkg.version);
+  ' || die "$EX_BUMP" "Failed to bump package.json version."
+}
+
+bump_app_config_version() {
+  local new_version="$1"
+  local config_file=""
+
+  if [[ -f app.config.ts ]]; then
+    config_file="app.config.ts"
+  elif [[ -f app.config.js ]]; then
+    config_file="app.config.js"
+  else
+    warn "No app.config.ts or app.config.js found; skipping app config version bump."
+    return 0
+  fi
+
+  NODE_NEW_VERSION="$new_version" NODE_CONFIG_FILE="$config_file" node -e '
+    const fs = require("fs");
+    const file = process.env.NODE_CONFIG_FILE;
+    const newVer = process.env.NODE_NEW_VERSION;
+    let content = fs.readFileSync(file, "utf8");
+    let changed = [];
+
+    const verRegex = /(version\s*:\s*)(["'"'"'])(\d+\.\d+\.\d+)\2/;
+    if (verRegex.test(content)) {
+      content = content.replace(verRegex, (_, pre, q) => pre + q + newVer + q);
+      changed.push("version -> " + newVer);
+    } else {
+      console.error("WARN: version pattern not found in " + file);
+    }
+
+    const bnRegex = /(buildNumber\s*:\s*)(["'"'"'])(\d+)\2/;
+    if (bnRegex.test(content)) {
+      content = content.replace(bnRegex, (_, pre, q, n) => {
+        const next = String(Number(n) + 1);
+        changed.push("buildNumber -> " + next);
+        return pre + q + next + q;
+      });
+    } else {
+      console.error("WARN: buildNumber pattern not found in " + file);
+    }
+
+    const vcRegex = /(versionCode\s*:\s*)(\d+)/;
+    if (vcRegex.test(content)) {
+      content = content.replace(vcRegex, (_, pre, n) => {
+        const next = String(Number(n) + 1);
+        changed.push("versionCode -> " + next);
+        return pre + next;
+      });
+    } else {
+      console.error("WARN: versionCode pattern not found in " + file);
+    }
+
+    fs.writeFileSync(file, content);
+    if (changed.length) console.log(changed.join(", "));
+  ' || die "$EX_BUMP" "Failed to bump app config versions in $config_file."
 }
 
 clean_node_modules() {
@@ -338,6 +451,7 @@ INSTALL_MODE=""        # "npm-ci" or "npm-install"
 SKIP_PREREQ=0
 SKIP_ROOT_CHECK=0
 SUBMIT_MODE=""
+BUMP_VERSION=0
 
 # Env file defaults (new behavior)
 ENV_DEV_FILE=".env.dev"
@@ -415,6 +529,7 @@ while [[ $# -gt 0 ]]; do
       [[ -z "$SUBMIT_MODE" ]] || arg_error "Conflicting submit flags (already set to \"$SUBMIT_MODE\")."
       SUBMIT_MODE="internal"
       ;;
+    --bump) BUMP_VERSION=1 ;;
     --skip-prereq) SKIP_PREREQ=1 ;;
     --skip-root-check) SKIP_ROOT_CHECK=1 ;;
     -h|--help)
@@ -510,7 +625,10 @@ env_template=$ENV_SRC_FILE
 env_out=$ENV_OUT_FILE
 clean_node_modules=$CLEAN_NODE_MODULES
 skip_prereq=$SKIP_PREREQ
-submit_mode=${SUBMIT_MODE:-none}"
+submit_mode=${SUBMIT_MODE:-none}
+bump_version=$BUMP_VERSION"
+
+_deploy_start=$(date +%s)
 
 # -------------------------
 # Parallel build cleanup (--both)
@@ -560,6 +678,7 @@ fi
 # -------------------------
 # Dependency install
 # -------------------------
+step_start "npm install"
 if [[ "$INSTALL_MODE" == "npm-ci" ]]; then
   [[ -f package-lock.json ]] || die "$EX_CONFIG" "npm ci requested but package-lock.json not found. Commit a lockfile or use --npm-install."
   log "Running npm ci..."
@@ -574,13 +693,32 @@ else
   fi
   log "npm install OK."
 fi
+step_end
 
 # -------------------------
 # Set env & prebuild (NO package.json scripts)
 # -------------------------
+step_start "env apply"
 log "Applying env: $ENV_SRC_FILE -> $ENV_OUT_FILE ..."
 apply_env_file_atomic "$ENV_SRC_FILE" "$ENV_OUT_FILE"
 log "Env applied."
+step_end
+
+# -------------------------
+# Version bump (optional)
+# -------------------------
+if [[ "$BUMP_VERSION" -eq 1 ]]; then
+  step_start "version bump"
+  log "Bumping version (patch + buildNumber + versionCode)..."
+  NEW_VERSION=$(bump_package_json_version)
+  log "package.json version -> $NEW_VERSION"
+  BUMP_DETAILS=$(bump_app_config_version "$NEW_VERSION")
+  if [[ -n "$BUMP_DETAILS" ]]; then
+    log "app config: $BUMP_DETAILS"
+  fi
+  log "Version bump complete."
+  step_end
+fi
 
 # Use local Expo CLI (deterministic; no global expo required)
 EXPO_BIN="./node_modules/.bin/expo"
@@ -592,19 +730,26 @@ if [[ ! -x "$EXPO_BIN" ]]; then
 fi
 
 if [[ "$PLATFORM" == "both" ]]; then
+  step_start "prebuild (ios)"
   log "Running expo prebuild for platform=ios..."
   if ! CI=1 "$EXPO_BIN" prebuild --platform ios; then
     die "$EX_PREBUILD" "expo prebuild (ios) failed."
   fi
+  step_end
+
+  step_start "prebuild (android)"
   log "Running expo prebuild for platform=android..."
   if ! CI=1 "$EXPO_BIN" prebuild --platform android; then
     die "$EX_PREBUILD" "expo prebuild (android) failed."
   fi
+  step_end
 else
+  step_start "prebuild ($PLATFORM)"
   log "Running expo prebuild for platform=$PLATFORM..."
   if ! CI=1 "$EXPO_BIN" prebuild --platform "$PLATFORM"; then
     die "$EX_PREBUILD" "expo prebuild failed."
   fi
+  step_end
 fi
 log "Prebuild done."
 
@@ -630,11 +775,13 @@ if [[ "$PLATFORM" == "both" ]]; then
     IOS_BUILD_ARGS+=(--output "$IOS_ARTIFACT")
   fi
 
+  step_start "eas build (ios)"
   log "[ios] Running eas build ${IOS_BUILD_ARGS[*]}..."
   if ! eas build "${IOS_BUILD_ARGS[@]}"; then
     die "$EX_EAS" "[ios] eas build failed."
   fi
   log "[ios] Build completed."
+  step_end
 
   # --- Android build ---
   ANDROID_ARTIFACT=""
@@ -644,11 +791,13 @@ if [[ "$PLATFORM" == "both" ]]; then
     ANDROID_BUILD_ARGS+=(--output "$ANDROID_ARTIFACT")
   fi
 
+  step_start "eas build (android)"
   log "[android] Running eas build ${ANDROID_BUILD_ARGS[*]}..."
   if ! eas build "${ANDROID_BUILD_ARGS[@]}"; then
     die "$EX_EAS" "[android] eas build failed."
   fi
   log "[android] Build completed."
+  step_end
 
   # --- Submit both (if requested) ---
   if [[ -n "$SUBMIT_MODE" ]]; then
@@ -658,12 +807,14 @@ if [[ "$PLATFORM" == "both" ]]; then
       IOS_SUBMIT_ARGS+=(--profile "$SUBMIT_PROFILE")
     fi
 
+    step_start "submit (ios)"
     log "[ios] Submitting to testflight (eas submit ${IOS_SUBMIT_ARGS[*]})..."
     if ! eas submit "${IOS_SUBMIT_ARGS[@]}"; then
       err "[ios] Build artifact preserved at: $IOS_ARTIFACT"
       die "$EX_SUBMIT" "[ios] eas submit failed."
     fi
     log "[ios] Submission to testflight completed."
+    step_end
 
     [[ -f "$ANDROID_ARTIFACT" ]] || die "$EX_SUBMIT" "[android] Build artifact not found at $ANDROID_ARTIFACT."
     ANDROID_SUBMIT_ARGS=(--platform android --path "$ANDROID_ARTIFACT" --non-interactive)
@@ -671,12 +822,14 @@ if [[ "$PLATFORM" == "both" ]]; then
       ANDROID_SUBMIT_ARGS+=(--profile "$SUBMIT_PROFILE")
     fi
 
+    step_start "submit (android)"
     log "[android] Submitting to internal (eas submit ${ANDROID_SUBMIT_ARGS[*]})..."
     if ! eas submit "${ANDROID_SUBMIT_ARGS[@]}"; then
       err "[android] Build artifact preserved at: $ANDROID_ARTIFACT"
       die "$EX_SUBMIT" "[android] eas submit failed."
     fi
     log "[android] Submission to internal completed."
+    step_end
   fi
 else
   # Single-platform build
@@ -692,10 +845,12 @@ else
     EAS_BUILD_ARGS+=(--output "$BUILD_ARTIFACT")
   fi
 
+  step_start "eas build ($PLATFORM)"
   log "Running eas build ${EAS_BUILD_ARGS[*]}..."
   if ! eas build "${EAS_BUILD_ARGS[@]}"; then
     die "$EX_EAS" "eas build failed."
   fi
+  step_end
 
   # -------------------------
   # EAS submit (TestFlight / Internal Testing)
@@ -708,15 +863,17 @@ else
       EAS_SUBMIT_ARGS+=(--profile "$SUBMIT_PROFILE")
     fi
 
+    step_start "submit ($PLATFORM)"
     log "Submitting build to ${SUBMIT_MODE} (eas submit ${EAS_SUBMIT_ARGS[*]})..."
     if ! eas submit "${EAS_SUBMIT_ARGS[@]}"; then
       err "Build artifact preserved at: $BUILD_ARTIFACT"
       die "$EX_SUBMIT" "eas submit failed."
     fi
-
     log "Submission to ${SUBMIT_MODE} completed successfully."
+    step_end
   fi
 fi
 
+print_timing_summary
 log "Deploy finished successfully."
 exit "$EX_SUCCESS"

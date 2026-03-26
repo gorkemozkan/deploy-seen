@@ -6,6 +6,8 @@ Bash script to standardize local EAS builds and store submissions.
 - Runs `expo prebuild` for the selected platform
 - Runs `eas build --local --non-interactive`
 - Optionally submits to TestFlight (iOS) or Internal Testing (Android) via `eas submit`
+- Optional version bump (`--bump`): increments `version`, `buildNumber`, and `versionCode`
+- Build timing summary printed at the end of every deploy
 - Provides safer defaults (conflicting flags detection, optional node_modules cleanup, deterministic installs in CI, etc.)
 
 ## What this script does
@@ -40,7 +42,17 @@ When you run:
   - Same as `--both --prod` above, plus:
   - Submits iOS to **TestFlight** and Android to **Internal Testing** after both builds complete
 
+- `./deploy.sh --ios --dev --bump`
+  - Before prebuild, increments:
+    - `package.json` version (patch: 1.2.3 -> 1.2.4)
+    - `app.config.ts` version (1.2.3 -> 1.2.4)
+    - `app.config.ts` ios.buildNumber ("42" -> "43")
+    - `app.config.ts` android.versionCode (42 -> 43)
+  - Then proceeds with normal build flow
+
 Same logic applies for other platform/environment combinations.
+
+A timing summary is printed at the end of every deploy showing how long each step took.
 
 ## Requirements
 
@@ -104,6 +116,28 @@ To enable non-interactive submissions, add a `submit` section to your `eas.json`
 
 The script uses the same profile name for both build and submit (matching the `--auto-submit` convention from EAS). You can override it with `--profile <name>`.
 
+## Version bump (`--bump`)
+
+When `--bump` is passed, the script increments versions **before** prebuild:
+
+| File | Field | Example |
+|---|---|---|
+| `package.json` | `version` | 1.2.3 -> 1.2.4 (patch) |
+| `app.config.ts` | `version` | 1.2.3 -> 1.2.4 (patch) |
+| `app.config.ts` | `ios.buildNumber` | "42" -> "43" |
+| `app.config.ts` | `android.versionCode` | 42 -> 43 |
+
+Without `--bump`, no version files are modified. The script does **not** commit changes — that decision is left to you.
+
+Typical workflow: bump once during a dev build, then deploy to prod/TestFlight without bumping again:
+
+```bash
+./deploy.sh --ios --dev --bump      # bump + dev build
+./deploy.sh --ios --prod --tf       # same version, submit to TestFlight
+```
+
+Also works with `app.config.js`. If no `app.config.ts`/`app.config.js` is found, only `package.json` is bumped.
+
 ## Environment files
 
 By default, the script expects:
@@ -158,4 +192,7 @@ chmod +x ./deploy.sh
 
 # Build both platforms (dev)
 ./deploy.sh --both --dev
+
+# Bump version before building (patch + buildNumber + versionCode)
+./deploy.sh --ios --dev --bump
 ```
