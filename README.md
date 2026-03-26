@@ -1,10 +1,11 @@
 # Deploy Seen
 
-Bash script to standardize local EAS builds.
+Bash script to standardize local EAS builds and store submissions.
 
 - Selects environment (dev/prod) by overwriting `.env`
 - Runs `expo prebuild` for the selected platform
 - Runs `eas build --local --non-interactive`
+- Optionally submits to TestFlight (iOS) or Internal Testing (Android) via `eas submit`
 - Provides safer defaults (conflicting flags detection, optional node_modules cleanup, deterministic installs in CI, etc.)
 
 ## What this script does
@@ -22,7 +23,15 @@ When you run:
   - Runs `expo prebuild --platform ios`
   - Runs `eas build --platform ios --profile production --local --non-interactive`
 
-Same logic applies for `--android`.
+- `./deploy.sh --ios --prod --tf`
+  - Same as `--ios --prod` above, plus:
+  - Submits the build artifact to **TestFlight** via `eas submit --platform ios`
+
+- `./deploy.sh --android --prod --it`
+  - Same as `--android --prod` above, plus:
+  - Submits the build artifact to **Google Play Internal Testing** via `eas submit --platform android`
+
+Same logic applies for other platform/environment combinations.
 
 ## Requirements
 
@@ -46,6 +55,45 @@ Android local builds:
 - `sdkmanager` available (Android commandline-tools)
 
 > Note: Local EAS builds require your machine to have the necessary native build toolchain installed.
+
+### Store submission prerequisites
+
+When using `--tf` or `--it`, additional prerequisites apply:
+
+**iOS (TestFlight):**
+
+- An [Apple Developer account](https://developer.apple.com/account/)
+- `ascAppId` configured in the submit profile of `eas.json` (or an App Store Connect API Key)
+
+**Android (Internal Testing):**
+
+- A [Google Play Developer account](https://play.google.com/apps/publish/signup/)
+- A [Google Service Account Key](https://github.com/expo/fyi/blob/main/creating-google-service-account.md) configured via EAS credentials
+- The app must have been uploaded manually to Google Play Console at least once
+
+> See the [EAS Submit docs](https://docs.expo.dev/submit/introduction/) for full credential setup.
+
+## Submit profiles in eas.json
+
+To enable non-interactive submissions, add a `submit` section to your `eas.json`:
+
+```json
+{
+  "build": { ... },
+  "submit": {
+    "production": {
+      "ios": {
+        "ascAppId": "your-app-store-connect-app-id"
+      },
+      "android": {
+        "track": "internal"
+      }
+    }
+  }
+}
+```
+
+The script uses the same profile name for both build and submit (matching the `--auto-submit` convention from EAS). You can override it with `--profile <name>`.
 
 ## Environment files
 
@@ -86,4 +134,10 @@ chmod +x ./deploy.sh
 
 # Override EAS profile
 ./deploy.sh --android --prod --profile staging
+
+# Build and submit to TestFlight
+./deploy.sh --ios --prod --tf
+
+# Build and submit to Google Play Internal Testing
+./deploy.sh --android --prod --it
 ```

@@ -26,6 +26,7 @@ readonly EX_INSTALL=40
 readonly EX_SETENV=41
 readonly EX_PREBUILD=42
 readonly EX_EAS=50
+readonly EX_SUBMIT=51
 
 # Unhandled
 readonly EX_UNEXPECTED=99
@@ -60,9 +61,13 @@ Required:
   --dev | --development             Development environment (uses .env.dev -> .env)
   --prod | --production             Production environment (uses .env.prod -> .env)
 
+Submission:
+  --tf                              Submit iOS build to TestFlight (requires --ios)
+  --it                              Submit Android build to Internal Testing (requires --android)
+
 Options:
   --project <dir>                   Run from a specific project directory (default: current directory)
-  --profile <name>                  Override EAS build profile (default: development for dev, production for prod)
+  --profile <name>                  Override EAS build/submit profile (default: development for dev, production for prod)
 
   --env-dev-file <path>             Dev env template file (default: .env.dev)
   --env-prod-file <path>            Prod env template file (default: .env.prod)
@@ -86,6 +91,8 @@ Examples:
   $SCRIPT_NAME --project /Users/me/myapp --android --prod
   $SCRIPT_NAME --android --prod --profile staging
   CI=true $SCRIPT_NAME --ios --prod --npm-ci
+  $SCRIPT_NAME --ios --prod --tf
+  $SCRIPT_NAME --android --prod --it
 EOF
 }
 
@@ -165,6 +172,16 @@ eas_profiles_list() {
     const keys=Object.keys((eas && eas.build) || {});
     console.log(keys.length ? keys.join(", ") : "(none)");
   '
+}
+
+eas_submit_profile_exists() {
+  local profile="$1"
+  NODE_EAS_PROFILE="$profile" node -e '
+    const fs=require("fs");
+    const eas=JSON.parse(fs.readFileSync("eas.json","utf8").replace(/\/\/.*$/gm,"").replace(/\/\*[\s\S]*?\*\//g,""));
+    const p=process.env.NODE_EAS_PROFILE;
+    process.exit(eas.submit && Object.prototype.hasOwnProperty.call(eas.submit, p) ? 0 : 1);
+  ' >/dev/null 2>&1
 }
 
 clean_node_modules() {
@@ -315,6 +332,7 @@ FORCE_CLEAN=0
 INSTALL_MODE=""        # "npm-ci" or "npm-install"
 SKIP_PREREQ=0
 SKIP_ROOT_CHECK=0
+SUBMIT_MODE=""
 
 # Env file defaults (new behavior)
 ENV_DEV_FILE=".env.dev"
@@ -380,6 +398,14 @@ while [[ $# -gt 0 ]]; do
       [[ "$INSTALL_MODE" != "npm-ci" ]] || arg_error "Cannot combine --npm-install with --npm-ci."
       INSTALL_MODE="npm-install"
       ;;
+    --tf)
+      [[ -z "$SUBMIT_MODE" ]] || arg_error "Conflicting submit flags (already set to \"$SUBMIT_MODE\")."
+      SUBMIT_MODE="testflight"
+      ;;
+    --it)
+      [[ -z "$SUBMIT_MODE" ]] || arg_error "Conflicting submit flags (already set to \"$SUBMIT_MODE\")."
+      SUBMIT_MODE="internal"
+      ;;
     --skip-prereq) SKIP_PREREQ=1 ;;
     --skip-root-check) SKIP_ROOT_CHECK=1 ;;
     -h|--help)
@@ -395,6 +421,13 @@ done
 
 [[ -n "$PLATFORM" ]] || arg_error "Platform must be specified (--ios or --android)."
 [[ -n "$ENVIRONMENT" ]] || arg_error "Environment must be specified (--dev/--development or --prod/--production)."
+
+if [[ "$SUBMIT_MODE" == "testflight" && "$PLATFORM" != "ios" ]]; then
+  arg_error "--tf (TestFlight) requires --ios."
+fi
+if [[ "$SUBMIT_MODE" == "internal" && "$PLATFORM" != "android" ]]; then
+  arg_error "--it (Internal Testing) requires --android."
+fi
 
 if [[ -n "$PROJECT_DIR" ]]; then
   [[ -d "$PROJECT_DIR" ]] || die "$EX_PROJECT" "Project directory not found: $PROJECT_DIR"
@@ -441,6 +474,14 @@ if ! eas_profile_exists "$EAS_PROFILE"; then
   die "$EX_CONFIG" "EAS profile \"$EAS_PROFILE\" not found in eas.json (build.*). Available: $(eas_profiles_list)"
 fi
 
+SUBMIT_PROFILE=""
+if [[ -n "$SUBMIT_MODE" ]]; then
+  SUBMIT_PROFILE="$EAS_PROFILE"
+  if ! eas_submit_profile_exists "$SUBMIT_PROFILE"; then
+    warn "Submit profile \"$SUBMIT_PROFILE\" not found in eas.json (submit.*). eas submit may prompt or fail in non-interactive mode."
+  fi
+fi
+
 # Decide install mode
 if [[ -z "$INSTALL_MODE" ]]; then
   if is_ci; then
@@ -459,7 +500,8 @@ install_mode=$INSTALL_MODE
 env_template=$ENV_SRC_FILE
 env_out=$ENV_OUT_FILE
 clean_node_modules=$CLEAN_NODE_MODULES
-skip_prereq=$SKIP_PREREQ"
+skip_prereq=$SKIP_PREREQ
+submit_mode=${SUBMIT_MODE:-none}"
 
 # -------------------------
 # Prereq checks (local builds)
@@ -542,9 +584,41 @@ fi
 # -------------------------
 # EAS build
 # -------------------------
-log "Running eas build --platform $PLATFORM --profile $EAS_PROFILE --local --non-interactive..."
-if ! eas build --platform "$PLATFORM" --profile "$EAS_PROFILE" --local --non-interactive; then
+BUILD_ARTIFACT=""
+EAS_BUILD_ARGS=(--platform "$PLATFORM" --profile "$EAS_PROFILE" --local --non-interactive)
+
+if [[ -n "$SUBMIT_MODE" ]]; then
+  if [[ "$PLATFORM" == "ios" ]]; then
+    BUILD_ARTIFACT="$(pwd)/deploy-build.ipa"
+  else
+    BUILD_ARTIFACT="$(pwd)/deploy-build.aab"
+  fi
+  EAS_BUILD_ARGS+=(--output "$BUILD_ARTIFACT")
+fi
+
+log "Running eas build ${EAS_BUILD_ARGS[*]}..."
+if ! eas build "${EAS_BUILD_ARGS[@]}"; then
   die "$EX_EAS" "eas build failed."
+fi
+
+# -------------------------
+# EAS submit (TestFlight / Internal Testing)
+# -------------------------
+if [[ -n "$SUBMIT_MODE" ]]; then
+  [[ -f "$BUILD_ARTIFACT" ]] || die "$EX_SUBMIT" "Build artifact not found at $BUILD_ARTIFACT after successful build."
+
+  EAS_SUBMIT_ARGS=(--platform "$PLATFORM" --path "$BUILD_ARTIFACT" --non-interactive)
+  if eas_submit_profile_exists "$SUBMIT_PROFILE"; then
+    EAS_SUBMIT_ARGS+=(--profile "$SUBMIT_PROFILE")
+  fi
+
+  log "Submitting build to ${SUBMIT_MODE} (eas submit ${EAS_SUBMIT_ARGS[*]})..."
+  if ! eas submit "${EAS_SUBMIT_ARGS[@]}"; then
+    err "Build artifact preserved at: $BUILD_ARTIFACT"
+    die "$EX_SUBMIT" "eas submit failed."
+  fi
+
+  log "Submission to ${SUBMIT_MODE} completed successfully."
 fi
 
 log "Deploy finished successfully."
