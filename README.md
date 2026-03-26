@@ -31,6 +31,15 @@ When you run:
   - Same as `--android --prod` above, plus:
   - Submits the build artifact to **Google Play Internal Testing** via `eas submit --platform android`
 
+- `./deploy.sh --both --prod`
+  - Removes `node_modules`, `ios/`, and `android/` directories
+  - Runs shared setup (install, env, prebuild for both platforms)
+  - Builds iOS then Android sequentially
+
+- `./deploy.sh --both --prod --tf` (or `--it`)
+  - Same as `--both --prod` above, plus:
+  - Submits iOS to **TestFlight** and Android to **Internal Testing** after both builds complete
+
 Same logic applies for other platform/environment combinations.
 
 ## Requirements
@@ -140,4 +149,13 @@ chmod +x ./deploy.sh
 
 # Build and submit to Google Play Internal Testing
 ./deploy.sh --android --prod --it
+
+# Build both platforms
+./deploy.sh --both --prod
+
+# Build both platforms + submit to TestFlight & Internal Testing
+./deploy.sh --both --prod --tf
+
+# Build both platforms (dev)
+./deploy.sh --both --dev
 ```

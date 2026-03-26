@@ -54,16 +54,17 @@ err()  { _log "ERROR" "$*"; }
 usage() {
   cat <<EOF
 Usage:
-  $SCRIPT_NAME [--project /path/to/project] --ios|--android --dev|--prod [options]
+  $SCRIPT_NAME [--project /path/to/project] --ios|--android|--both --dev|--prod [options]
 
 Required:
-  --ios | --android                 Target platform
+  --ios | --android | --both        Target platform (--both builds iOS and Android sequentially)
   --dev | --development             Development environment (uses .env.dev -> .env)
   --prod | --production             Production environment (uses .env.prod -> .env)
 
 Submission:
-  --tf                              Submit iOS build to TestFlight (requires --ios)
-  --it                              Submit Android build to Internal Testing (requires --android)
+  --tf                              Submit iOS build to TestFlight (requires --ios or --both)
+  --it                              Submit Android build to Internal Testing (requires --android or --both)
+                                    With --both, either flag submits both platforms to their respective tracks
 
 Options:
   --project <dir>                   Run from a specific project directory (default: current directory)
@@ -84,6 +85,7 @@ Options:
 Defaults:
   - If CI=true/1/yes -> npm ci
   - Otherwise -> npm install
+  - --both always removes node_modules, ios/, and android/ before building
 
 Examples:
   $SCRIPT_NAME --ios --dev
@@ -93,6 +95,9 @@ Examples:
   CI=true $SCRIPT_NAME --ios --prod --npm-ci
   $SCRIPT_NAME --ios --prod --tf
   $SCRIPT_NAME --android --prod --it
+  $SCRIPT_NAME --both --prod
+  $SCRIPT_NAME --both --prod --tf
+  $SCRIPT_NAME --both --dev
 EOF
 }
 
@@ -356,6 +361,10 @@ while [[ $# -gt 0 ]]; do
       [[ -z "$PLATFORM" ]] || arg_error "Conflicting platform flags (already set to \"$PLATFORM\")."
       PLATFORM="android"
       ;;
+    --both)
+      [[ -z "$PLATFORM" ]] || arg_error "Conflicting platform flags (already set to \"$PLATFORM\")."
+      PLATFORM="both"
+      ;;
     --dev|--development)
       [[ -z "$ENVIRONMENT" ]] || arg_error "Conflicting environment flags (already set to \"$ENVIRONMENT\")."
       ENVIRONMENT="development"
@@ -419,14 +428,14 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-[[ -n "$PLATFORM" ]] || arg_error "Platform must be specified (--ios or --android)."
+[[ -n "$PLATFORM" ]] || arg_error "Platform must be specified (--ios, --android, or --both)."
 [[ -n "$ENVIRONMENT" ]] || arg_error "Environment must be specified (--dev/--development or --prod/--production)."
 
-if [[ "$SUBMIT_MODE" == "testflight" && "$PLATFORM" != "ios" ]]; then
-  arg_error "--tf (TestFlight) requires --ios."
+if [[ "$SUBMIT_MODE" == "testflight" && "$PLATFORM" != "ios" && "$PLATFORM" != "both" ]]; then
+  arg_error "--tf (TestFlight) requires --ios or --both."
 fi
-if [[ "$SUBMIT_MODE" == "internal" && "$PLATFORM" != "android" ]]; then
-  arg_error "--it (Internal Testing) requires --android."
+if [[ "$SUBMIT_MODE" == "internal" && "$PLATFORM" != "android" && "$PLATFORM" != "both" ]]; then
+  arg_error "--it (Internal Testing) requires --android or --both."
 fi
 
 if [[ -n "$PROJECT_DIR" ]]; then
@@ -504,12 +513,29 @@ skip_prereq=$SKIP_PREREQ
 submit_mode=${SUBMIT_MODE:-none}"
 
 # -------------------------
+# Parallel build cleanup (--both)
+# -------------------------
+if [[ "$PLATFORM" == "both" ]]; then
+  if [[ -e node_modules ]]; then
+    log "Removing node_modules for parallel build..."
+    rm -rf -- node_modules || die "$EX_ROOT" "Failed to remove node_modules."
+  fi
+  for native_dir in ios android; do
+    if [[ -d "$native_dir" ]]; then
+      log "Removing ${native_dir}/ for parallel build..."
+      rm -rf -- "$native_dir" || die "$EX_ROOT" "Failed to remove ${native_dir}/."
+    fi
+  done
+fi
+
+# -------------------------
 # Prereq checks (local builds)
 # -------------------------
 if [[ "$SKIP_PREREQ" -ne 1 ]]; then
-  if [[ "$PLATFORM" == "ios" ]]; then
+  if [[ "$PLATFORM" == "ios" || "$PLATFORM" == "both" ]]; then
     check_ios_prereqs_pre
-  else
+  fi
+  if [[ "$PLATFORM" == "android" || "$PLATFORM" == "both" ]]; then
     check_android_prereqs_pre
   fi
 else
@@ -565,60 +591,131 @@ if [[ ! -x "$EXPO_BIN" ]]; then
   chmod +x "$EXPO_BIN" >/dev/null 2>&1 || true
 fi
 
-log "Running expo prebuild for platform=$PLATFORM..."
-# Put --non-interactive BEFORE subcommand for safest parsing of global options.
-if ! "$EXPO_BIN" --non-interactive prebuild --platform "$PLATFORM"; then
-  die "$EX_PREBUILD" "expo prebuild failed."
+if [[ "$PLATFORM" == "both" ]]; then
+  log "Running expo prebuild for platform=ios..."
+  if ! CI=1 "$EXPO_BIN" prebuild --platform ios; then
+    die "$EX_PREBUILD" "expo prebuild (ios) failed."
+  fi
+  log "Running expo prebuild for platform=android..."
+  if ! CI=1 "$EXPO_BIN" prebuild --platform android; then
+    die "$EX_PREBUILD" "expo prebuild (android) failed."
+  fi
+else
+  log "Running expo prebuild for platform=$PLATFORM..."
+  if ! CI=1 "$EXPO_BIN" prebuild --platform "$PLATFORM"; then
+    die "$EX_PREBUILD" "expo prebuild failed."
+  fi
 fi
 log "Prebuild done."
 
 # Post-prebuild checks
 if [[ "$SKIP_PREREQ" -ne 1 ]]; then
-  if [[ "$PLATFORM" == "ios" ]]; then
+  if [[ "$PLATFORM" == "ios" || "$PLATFORM" == "both" ]]; then
     check_ios_prereqs_post
-  else
+  fi
+  if [[ "$PLATFORM" == "android" || "$PLATFORM" == "both" ]]; then
     check_android_prereqs_post
   fi
 fi
 
 # -------------------------
-# EAS build
+# EAS build (& submit)
 # -------------------------
-BUILD_ARTIFACT=""
-EAS_BUILD_ARGS=(--platform "$PLATFORM" --profile "$EAS_PROFILE" --local --non-interactive)
-
-if [[ -n "$SUBMIT_MODE" ]]; then
-  if [[ "$PLATFORM" == "ios" ]]; then
-    BUILD_ARTIFACT="$(pwd)/deploy-build.ipa"
-  else
-    BUILD_ARTIFACT="$(pwd)/deploy-build.aab"
-  fi
-  EAS_BUILD_ARGS+=(--output "$BUILD_ARTIFACT")
-fi
-
-log "Running eas build ${EAS_BUILD_ARGS[*]}..."
-if ! eas build "${EAS_BUILD_ARGS[@]}"; then
-  die "$EX_EAS" "eas build failed."
-fi
-
-# -------------------------
-# EAS submit (TestFlight / Internal Testing)
-# -------------------------
-if [[ -n "$SUBMIT_MODE" ]]; then
-  [[ -f "$BUILD_ARTIFACT" ]] || die "$EX_SUBMIT" "Build artifact not found at $BUILD_ARTIFACT after successful build."
-
-  EAS_SUBMIT_ARGS=(--platform "$PLATFORM" --path "$BUILD_ARTIFACT" --non-interactive)
-  if eas_submit_profile_exists "$SUBMIT_PROFILE"; then
-    EAS_SUBMIT_ARGS+=(--profile "$SUBMIT_PROFILE")
+if [[ "$PLATFORM" == "both" ]]; then
+  # --- iOS build ---
+  IOS_ARTIFACT=""
+  IOS_BUILD_ARGS=(--platform ios --profile "$EAS_PROFILE" --local --non-interactive)
+  if [[ -n "$SUBMIT_MODE" ]]; then
+    IOS_ARTIFACT="$(pwd)/deploy-build-ios.ipa"
+    IOS_BUILD_ARGS+=(--output "$IOS_ARTIFACT")
   fi
 
-  log "Submitting build to ${SUBMIT_MODE} (eas submit ${EAS_SUBMIT_ARGS[*]})..."
-  if ! eas submit "${EAS_SUBMIT_ARGS[@]}"; then
-    err "Build artifact preserved at: $BUILD_ARTIFACT"
-    die "$EX_SUBMIT" "eas submit failed."
+  log "[ios] Running eas build ${IOS_BUILD_ARGS[*]}..."
+  if ! eas build "${IOS_BUILD_ARGS[@]}"; then
+    die "$EX_EAS" "[ios] eas build failed."
+  fi
+  log "[ios] Build completed."
+
+  # --- Android build ---
+  ANDROID_ARTIFACT=""
+  ANDROID_BUILD_ARGS=(--platform android --profile "$EAS_PROFILE" --local --non-interactive)
+  if [[ -n "$SUBMIT_MODE" ]]; then
+    ANDROID_ARTIFACT="$(pwd)/deploy-build-android.aab"
+    ANDROID_BUILD_ARGS+=(--output "$ANDROID_ARTIFACT")
   fi
 
-  log "Submission to ${SUBMIT_MODE} completed successfully."
+  log "[android] Running eas build ${ANDROID_BUILD_ARGS[*]}..."
+  if ! eas build "${ANDROID_BUILD_ARGS[@]}"; then
+    die "$EX_EAS" "[android] eas build failed."
+  fi
+  log "[android] Build completed."
+
+  # --- Submit both (if requested) ---
+  if [[ -n "$SUBMIT_MODE" ]]; then
+    [[ -f "$IOS_ARTIFACT" ]] || die "$EX_SUBMIT" "[ios] Build artifact not found at $IOS_ARTIFACT."
+    IOS_SUBMIT_ARGS=(--platform ios --path "$IOS_ARTIFACT" --non-interactive)
+    if eas_submit_profile_exists "$SUBMIT_PROFILE"; then
+      IOS_SUBMIT_ARGS+=(--profile "$SUBMIT_PROFILE")
+    fi
+
+    log "[ios] Submitting to testflight (eas submit ${IOS_SUBMIT_ARGS[*]})..."
+    if ! eas submit "${IOS_SUBMIT_ARGS[@]}"; then
+      err "[ios] Build artifact preserved at: $IOS_ARTIFACT"
+      die "$EX_SUBMIT" "[ios] eas submit failed."
+    fi
+    log "[ios] Submission to testflight completed."
+
+    [[ -f "$ANDROID_ARTIFACT" ]] || die "$EX_SUBMIT" "[android] Build artifact not found at $ANDROID_ARTIFACT."
+    ANDROID_SUBMIT_ARGS=(--platform android --path "$ANDROID_ARTIFACT" --non-interactive)
+    if eas_submit_profile_exists "$SUBMIT_PROFILE"; then
+      ANDROID_SUBMIT_ARGS+=(--profile "$SUBMIT_PROFILE")
+    fi
+
+    log "[android] Submitting to internal (eas submit ${ANDROID_SUBMIT_ARGS[*]})..."
+    if ! eas submit "${ANDROID_SUBMIT_ARGS[@]}"; then
+      err "[android] Build artifact preserved at: $ANDROID_ARTIFACT"
+      die "$EX_SUBMIT" "[android] eas submit failed."
+    fi
+    log "[android] Submission to internal completed."
+  fi
+else
+  # Single-platform build
+  BUILD_ARTIFACT=""
+  EAS_BUILD_ARGS=(--platform "$PLATFORM" --profile "$EAS_PROFILE" --local --non-interactive)
+
+  if [[ -n "$SUBMIT_MODE" ]]; then
+    if [[ "$PLATFORM" == "ios" ]]; then
+      BUILD_ARTIFACT="$(pwd)/deploy-build.ipa"
+    else
+      BUILD_ARTIFACT="$(pwd)/deploy-build.aab"
+    fi
+    EAS_BUILD_ARGS+=(--output "$BUILD_ARTIFACT")
+  fi
+
+  log "Running eas build ${EAS_BUILD_ARGS[*]}..."
+  if ! eas build "${EAS_BUILD_ARGS[@]}"; then
+    die "$EX_EAS" "eas build failed."
+  fi
+
+  # -------------------------
+  # EAS submit (TestFlight / Internal Testing)
+  # -------------------------
+  if [[ -n "$SUBMIT_MODE" ]]; then
+    [[ -f "$BUILD_ARTIFACT" ]] || die "$EX_SUBMIT" "Build artifact not found at $BUILD_ARTIFACT after successful build."
+
+    EAS_SUBMIT_ARGS=(--platform "$PLATFORM" --path "$BUILD_ARTIFACT" --non-interactive)
+    if eas_submit_profile_exists "$SUBMIT_PROFILE"; then
+      EAS_SUBMIT_ARGS+=(--profile "$SUBMIT_PROFILE")
+    fi
+
+    log "Submitting build to ${SUBMIT_MODE} (eas submit ${EAS_SUBMIT_ARGS[*]})..."
+    if ! eas submit "${EAS_SUBMIT_ARGS[@]}"; then
+      err "Build artifact preserved at: $BUILD_ARTIFACT"
+      die "$EX_SUBMIT" "eas submit failed."
+    fi
+
+    log "Submission to ${SUBMIT_MODE} completed successfully."
+  fi
 fi
 
 log "Deploy finished successfully."
